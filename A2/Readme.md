@@ -40,20 +40,20 @@ python A2/baseline.py --data-dir "A2/Assignment 2 Dataset" --out-dir "A2/outputs
 - LLM for span extraction:
 ```bash
 python A2/baseline.py --data-dir "A2/Assignment 2 Dataset" --out-dir "A2/outputs" ner \
-  --ner-backend llm --llm-base-model mistralai/Mistral-7B-Instruct-v0.2
+  --ner-backend llm --llm-base-model mistralai/Mistral-7B-Instruct-v0.2 --device cuda --gpu-id 0
 ```
 
 - FAISS retrieval + LLM selection:
 ```bash
 python A2/baseline.py --data-dir "A2/Assignment 2 Dataset" --out-dir "A2/outputs" link \
   --link-mode llm --embed-model sentence-transformers/all-MiniLM-L6-v2 \
-  --llm-base-model mistralai/Mistral-7B-Instruct-v0.2 --top-n 5
+  --llm-base-model mistralai/Mistral-7B-Instruct-v0.2 --top-n 5 --device cuda --gpu-id 0 --faiss-gpu
 ```
 
 - Quick LoRA fine-tune for span extraction (toy SFT):
 ```bash
 python A2/baseline.py --data-dir "A2/Assignment 2 Dataset" --out-dir "A2/outputs" llm-train \
-  --llm-base-model mistralai/Mistral-7B-Instruct-v0.2 --num-epochs 1 --batch-size 1 --max-examples 200
+  --llm-base-model mistralai/Mistral-7B-Instruct-v0.2 --num-epochs 1 --batch-size 2 --max-examples 200
 ```
 
 Notes:

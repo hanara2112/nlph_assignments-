@@ -423,7 +423,10 @@ def select_best(candidates: List[Dict[str, object]]) -> Optional[Dict[str, objec
 
 
 def ensure_faiss_resources(snomed_terms: pd.DataFrame,
-                           embed_model_name: str):
+                           embed_model_name: str,
+                           embed_device: str = 'cpu',
+                           gpu_id: int = 0,
+                           use_faiss_gpu: bool = False):
     """Build in-memory FAISS index and embedder. Returns (index, embedder, terms_list).
 
     We keep this in-memory to avoid adding extra files; re-use across calls within the same run.
@@ -434,12 +437,22 @@ def ensure_faiss_resources(snomed_terms: pd.DataFrame,
     except Exception as e:
         raise RuntimeError('Missing optional deps for LLM/FAISS: install sentence-transformers and faiss-cpu') from e
 
-    embedder = SentenceTransformer(embed_model_name)
+    # Create embedder on the requested device (e.g., 'cuda' or 'cuda:0')
+    embedder = SentenceTransformer(embed_model_name, device=embed_device)
     term_texts: List[str] = snomed_terms['term'].astype(str).tolist()
     vectors = embedder.encode(term_texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
     dim = int(vectors.shape[1])
     index = faiss.IndexFlatIP(dim)
     index.add(vectors)
+    # Optionally move FAISS index to GPU
+    if use_faiss_gpu and hasattr(faiss, 'StandardGpuResources'):
+        try:
+            import torch  # type: ignore
+            if torch.cuda.is_available():
+                res = faiss.StandardGpuResources()
+                index = faiss.index_cpu_to_gpu(res, int(gpu_id), index)
+        except Exception:
+            pass
     # Keep minimal meta alongside
     terms_list: List[Tuple[str, str]] = list(zip(snomed_terms['snomed_id'].astype(str).tolist(), term_texts))
     return index, embedder, terms_list
@@ -463,7 +476,8 @@ def retrieve_candidates_faiss(span_text: str,
 
 def load_llm_pipeline(base_model: str,
                       lora_adapter: Optional[str] = None,
-                      device: str = 'cpu'):
+                      device: str = 'cpu',
+                      gpu_id: int = 0):
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
@@ -483,8 +497,12 @@ def load_llm_pipeline(base_model: str,
         from peft import PeftModel  # type: ignore
         model = PeftModel.from_pretrained(model, lora_adapter)
     if device != 'cpu' and torch.cuda.is_available():
-        model = model.to('cuda')
-    pipe = pipeline('text-generation', model=model, tokenizer=tokenizer, device=0 if (device != 'cpu' and torch.cuda.is_available()) else -1)
+        target = f'cuda:{int(gpu_id)}' if ':' not in device else device
+        model = model.to(target)
+        pipe_device = int(gpu_id)
+    else:
+        pipe_device = -1
+    pipe = pipeline('text-generation', model=model, tokenizer=tokenizer, device=pipe_device)
     return pipe
 
 
@@ -565,7 +583,7 @@ def cmd_ner(args: argparse.Namespace) -> None:
     test_ann = pd.read_csv(test_ann_path) if test_ann_path.exists() else None
 
     if getattr(args, 'ner_backend', 'crf') == 'llm':
-        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), getattr(args, 'device', 'cpu'))
+        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), getattr(args, 'device', 'cpu'), getattr(args, 'gpu_id', 0))
         preds_df = extract_spans_with_llm(pipe, test_notes, max_new_tokens=getattr(args, 'max_new_tokens', 256))
         f1 = None
     else:
@@ -615,9 +633,18 @@ def cmd_link(args: argparse.Namespace) -> None:
     cand_records: List[Dict[str, object]] = []
     link_mode = getattr(args, 'link_mode', 'hybrid')
     if link_mode == 'llm':
-        # Build FAISS resources once
-        index, embedder, terms_list = ensure_faiss_resources(snomed_terms, getattr(args, 'embed_model', 'sentence-transformers/all-MiniLM-L6-v2'))
-        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), getattr(args, 'device', 'cpu'))
+        # Build FAISS resources once (optionally on GPU)
+        dev = getattr(args, 'device', 'cpu')
+        gpu_id = getattr(args, 'gpu_id', 0)
+        embed_device = (f'cuda:{int(gpu_id)}' if dev != 'cpu' else 'cpu')
+        index, embedder, terms_list = ensure_faiss_resources(
+            snomed_terms,
+            getattr(args, 'embed_model', 'sentence-transformers/all-MiniLM-L6-v2'),
+            embed_device=embed_device,
+            gpu_id=gpu_id,
+            use_faiss_gpu=getattr(args, 'faiss_gpu', False),
+        )
+        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), dev, gpu_id)
         for _, r in preds.iterrows():
             nid = str(r['note_id'])
             s, e = int(r['start']), int(r['end'])
@@ -644,7 +671,7 @@ def cmd_link(args: argparse.Namespace) -> None:
 
     linked_rows: List[Dict[str, object]] = []
     if link_mode == 'llm':
-        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), getattr(args, 'device', 'cpu'))
+        pipe = load_llm_pipeline(args.llm_base_model, getattr(args, 'lora_adapter', None), getattr(args, 'device', 'cpu'), getattr(args, 'gpu_id', 0))
         for rec in cand_records:
             best = llm_choose_concept(pipe, rec['span'], rec['candidates'], max_new_tokens=getattr(args, 'max_new_tokens', 64))
             linked_rows.append({
